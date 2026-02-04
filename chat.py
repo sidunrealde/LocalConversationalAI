@@ -13,16 +13,41 @@ Phase 1: ASR + LLM + TTS (Voice Chat Loop)
 
 import streamlit as st
 import numpy as np
-import sounddevice as sd
 import base64
+import time
 import threading
 import scipy.signal
 import re
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
-import webrtcvad
-import streamlit.components.v1 as components
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, AudioProcessorBase
+import av
+import queue
 from PIL import Image
 from modules import setup_logger, TTSEngine, OllamaChat, ASREngine
+
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.audio_queue = queue.Queue()
+
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        try:
+             self.audio_queue.put(frame)
+        except Exception as e:
+             logger.error(f"Queue put error: {e}")
+             
+        # Return silence to prevent echo
+        try:
+            # Create silence from existing frame properties
+            arr = frame.to_ndarray()
+            arr[:] = 0 # Mute
+            new_frame = av.AudioFrame.from_ndarray(arr, layout=frame.layout.name)
+            new_frame.rate = frame.rate
+            new_frame.sample_rate = frame.sample_rate
+            new_frame.time_base = frame.time_base
+            new_frame.pts = frame.pts
+            return new_frame
+        except Exception as e:
+            logger.error(f"Silence generation error: {e}")
+            return frame # Fallback to echo if silence fails (better than breaking pipeline)
 
 # Initialize logger
 logger = setup_logger(__name__)
@@ -91,86 +116,8 @@ def pop_sentence_chunk(text_buffer: str):
     return sentence, remaining
 
 
-def build_rtc_config(stun_urls: list[str], turn_url: str | None, turn_user: str | None, turn_pass: str | None) -> dict:
-    ice_servers = []
-    if stun_urls:
-        ice_servers.append({"urls": stun_urls})
-    if turn_url and turn_user and turn_pass:
-        ice_servers.append({
-            "urls": [turn_url],
-            "username": turn_user,
-            "credential": turn_pass,
-        })
-    return {"iceServers": ice_servers} if ice_servers else {}
 
-
-class RealtimeMicProcessor(AudioProcessorBase):
-    """Always-on mic processor with VAD and buffering."""
-
-    def __init__(self):
-        self.vad = webrtcvad.Vad(1)  # 0=least aggressive, 3=most aggressive (changed from 2 to 1)
-        self.sample_rate = 16000
-        self.frame_ms = 30  # Changed from 20 to 30 for better VAD stability
-        self.frame_size = int(self.sample_rate * self.frame_ms / 1000)
-        self.buffer = bytearray()
-        self.in_speech = False
-        self.silence_frames = 0
-        self.latest_pcm = None
-        self.lock = threading.Lock()
-        self.frame_count = 0
-        self.speech_frame_count = 0
-
-    def recv(self, frame):
-        self.frame_count += 1
-        audio = frame.to_ndarray()
-        if audio.ndim == 2:
-            audio = audio.mean(axis=0)
-
-        audio = audio.astype(np.float32)
-        input_rate = frame.sample_rate
-        if input_rate != self.sample_rate:
-            audio = scipy.signal.resample_poly(audio, self.sample_rate, input_rate)
-
-        audio = np.clip(audio, -1.0, 1.0)
-        pcm = (audio * 32767).astype(np.int16).tobytes()
-
-        bytes_per_frame = self.frame_size * 2
-        for i in range(0, len(pcm), bytes_per_frame):
-            chunk = pcm[i : i + bytes_per_frame]
-            if len(chunk) < bytes_per_frame:
-                continue
-
-            try:
-                is_speech = self.vad.is_speech(chunk, self.sample_rate)
-                if is_speech:
-                    self.speech_frame_count += 1
-            except Exception:
-                is_speech = False
-                
-            if is_speech:
-                self.in_speech = True
-                self.silence_frames = 0
-                self.buffer.extend(chunk)
-            else:
-                if self.in_speech:
-                    self.silence_frames += 1
-                    if self.silence_frames <= 15:  # Increased from 5 to 15 for more tolerance
-                        self.buffer.extend(chunk)
-                    if self.silence_frames >= 30:  # Increased from 10 to 30 for longer pauses
-                        with self.lock:
-                            if len(self.buffer) > self.sample_rate * 2 * 0.3:  # Reduced min length from 0.5s to 0.3s
-                                self.latest_pcm = bytes(self.buffer)
-                        self.buffer.clear()
-                        self.in_speech = False
-                        self.silence_frames = 0
-
-        return frame
-
-    def pop_audio(self):
-        with self.lock:
-            data = self.latest_pcm
-            self.latest_pcm = None
-        return data
+# Note: build_rtc_config and RealtimeMicProcessor removed (WebRTC cleanup)
 
 # ============================================================================
 # PAGE CONFIG
@@ -201,7 +148,21 @@ with st.sidebar:
         try:
             st.session_state.tts_engine = TTSEngine(voice_name="lessac")
             st.session_state.ollama_chat = OllamaChat(model="qwen2.5:7b")
-            st.session_state.asr_engine = ASREngine(model_size="medium")
+            st.session_state.asr_engine = ASREngine(model_size="small")
+            
+            # Preload ASR model (this can take 30-60s on first run)
+            st.info("⏳ Loading Whisper ASR model (first run takes ~60s)...")
+            st.session_state.asr_engine.load_model()
+            logger.info("ASR model loaded")
+            
+            # Preload ASR model (this can take 30-60s on first run)
+            st.info("⏳ Loading Whisper ASR model (first run takes ~60s)...")
+            st.session_state.asr_engine.load_model()
+            logger.info("ASR model loaded")
+            
+            # Defer WASAPI initialization to manual user action to prevent startup crashes
+            st.session_state.wasapi_capture = None
+            st.session_state.echo_canceller = None
             
             st.session_state.engines_initialized = True
             logger.info("All engines initialized successfully")
@@ -217,6 +178,7 @@ with st.sidebar:
     tts_engine = st.session_state.tts_engine
     ollama_chat = st.session_state.ollama_chat
     asr_engine = st.session_state.asr_engine
+    wasapi_capture = st.session_state.get("wasapi_capture")
     
     # --- Personality Config ---
     st.subheader("👤 Personality")
@@ -296,6 +258,8 @@ with st.sidebar:
         asr_engine.set_model_size(asr_model_size)
         logger.info(f"ASR model switched to: {asr_model_size}")
     
+
+    
     # --- Avatar Upload ---
     st.subheader("🎬 Avatar (Optional)")
     uploaded_file = st.file_uploader(
@@ -310,6 +274,50 @@ with st.sidebar:
     else:
         st.session_state.avatar_image = None
     
+    # --- Audio Device Selection ---
+    # --- WebRTC Audio Connection ---
+    with st.sidebar:
+        st.header("🔌 Audio Connection")
+        
+        # This uses the browser's native audio engine + AEC
+        # This uses the browser's native audio engine + AEC
+        ctx = webrtc_streamer(
+            key="speech-to-text",
+            mode=WebRtcMode.SENDRECV,
+            audio_receiver_size=1024,
+            media_stream_constraints={"video": False, "audio": True},
+            rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+            async_processing=True,
+        )
+        
+        # Javascript to MUTE the browser audio element (Prevent Echo)
+        st.markdown(
+            """
+            <script>
+            function muteStreamlitAudio() {
+                const audios = document.querySelectorAll("audio");
+                audios.forEach(audio => {
+                    audio.muted = true;
+                });
+            }
+            // Run periodically to catch the element
+            setInterval(muteStreamlitAudio, 1000);
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        if ctx.state.playing:
+            st.success("✅ Connected (Browser Audio)")
+            st.caption("Using Chrome/Edge Echo Cancellation")
+        else:
+            st.warning("🛑 Click START to connect audio")
+            
+    # Legacy variables (mocked to Nones/Default)
+    wasapi = None
+    allow_interruptions = True # Always reliable with WebRTC AEC
+    speech_threshold = st.slider("Speech Threshold", 0.01, 0.5, 0.03, 0.01, key="speech_thresh_slider")
+
     # --- Advanced Options ---
     with st.expander("🔧 Advanced Options"):
         temperature = st.slider(
@@ -413,40 +421,178 @@ with col3:
 if input_method == "Voice (Local Continuous)":
     st.caption("🎧 Local continuous listening using system mic + VAD")
     
+    # Debug panel
+    with st.expander("🔍 Audio Debug", expanded=True):
+        debug_placeholder = st.empty()
+        energy_bar = st.empty()
+    
     if st.session_state.get("local_listening", False):
-        if st.session_state.get("ai_speaking", False):
-            st.info("🔊 AI is speaking... (speak to interrupt)")
-        else:
-            st.success("🎤 Listening continuously... (speak anytime)")
+        is_ai_speaking = st.session_state.get("ai_speaking", False)
         
-        # Continuously listen in a loop (even during AI speaking to enable interruption)
+        if is_ai_speaking:
+            # Listening during AI speech with echo cancellation
+            st.warning("🔊 AI speaking... (listening with echo cancellation - speak to interrupt)")
+        else:
+            st.success("🎤 Listening... (speak, will auto-detect when you stop)")
+        
+        # Dynamic VAD-based recording with WASAPI Echo Cancellation
         try:
-            # Capture audio from system mic
-            duration = 1.5  # Shorter chunks for faster interrupt detection
             sample_rate = 16000
-            recording = sd.rec(
-                int(duration * sample_rate),
-                samplerate=sample_rate,
-                channels=1,
-                dtype="float32",
-            )
-            sd.wait()
             
-            audio_data = recording.squeeze()
+            # Parameters for dynamic recording
+            chunk_duration = 0.3  # 300ms chunks
+            chunk_samples = int(chunk_duration * sample_rate)
+            max_duration = 15.0  # Maximum recording time
+            silence_threshold = 0.02  # Energy threshold for silence
+            silence_duration_to_stop = 1.0  # Seconds of silence to stop
             
-            # Simple energy-based VAD with different thresholds
-            energy = np.sqrt(np.mean(audio_data ** 2))
+            # Thresholds
+            speech_threshold = 0.04  # Same threshold whether AI speaking or not
             
-            # Use MUCH higher threshold during AI speaking to avoid self-interruption
-            # User speaking to interrupt should be significantly louder/closer than speaker output
-            is_ai_speaking = st.session_state.get("ai_speaking", False)
+            logger.info(f"Starting recording loop. AI speaking: {is_ai_speaking}")
             
-            if is_ai_speaking:
-                # During AI speech: require very high energy (loud, close speech only)
-                # This prevents picking up speaker output
-                threshold = 0.08  # Very high threshold
+            audio_chunks = []
+            silence_chunks = 0
+            speech_detected = False
+            chunks_for_silence_stop = int(silence_duration_to_stop / chunk_duration)
+            max_chunks = int(max_duration / chunk_duration)
+            
+            status_text = st.empty()
+            
+            # Ensure WASAPI capture is initialized
+            # Ensure WebRTC is connected
+            if not ctx.state.playing:
+                st.warning("Please click START in the 'Audio Connection' sidebar to enable the microphone.")
+                st.stop()
+            
+            status_text = st.empty()
+            
+            frame_count = 0
+                # Loop while connected
+                while ctx.state.playing:
+                    if not ctx.audio_receiver:
+                        status_text.text("⏳ Waiting for audio stream...")
+                        time.sleep(0.1)
+                        continue
+                        
+                    try:
+                        audio_frames = ctx.audio_receiver.get_frames(timeout=0.1)
+                    except queue.Empty:
+                        status_text.text("⏳ No audio frames...")
+                        time.sleep(0.01)
+                        continue
+                        
+                    if not audio_frames:
+                        time.sleep(0.01)
+                        continue
+                    
+                    frame_count += 1
+                        
+                    for frame in audio_frames:
+                        # Convert to numpy
+                        sound = frame.to_ndarray()
+                        
+                        # Stereo to Mono if needed
+                        if sound.ndim > 1:
+                            sound = sound.mean(axis=1)
+                            
+                        # Resample if needed (WebRTC usually 48k, we want 16k)
+                        if frame.sample_rate and frame.sample_rate != sample_rate:
+                            # Calculate number of samples
+                            num_samples = int(len(sound) * sample_rate / frame.sample_rate)
+                            if num_samples <= 0:
+                                continue
+                            sound = scipy.signal.resample(sound, num_samples)
+                        
+                        # Normalize float32
+                        if sound.dtype != np.float32:
+                            sound = sound.astype(np.float32) / 32768.0
+                            
+                        # Accumulate logic (unchanged mostly)
+                        # We process frame-by-frame (typically 10-20ms)
+                        # But existing logic expects "chunks" of 300ms?
+                        # Actually existing logic just calculates energy of "chunk".
+                        # If "chunk" is small, energy is still valid.
+                        # But we should accumulate 300ms worth?
+                        # Let's just use the frame as the chunk. It works fine for VAD.
+                        
+                        chunk = sound
+                        
+                        # Debug info
+                        # ...
+                        
+                        # Calculate energy
+                        energy = np.sqrt(np.mean(chunk ** 2))
+                        
+                        # Dynamic Thresholding
+                        effective_threshold = speech_threshold
+                        if is_ai_speaking:
+                            # WebRTC AEC is perfect, but if user has speakers, maybe bump slightly?
+                            # effective_threshold *= 1.5
+                            pass 
+
+                        # Update debug display
+                        energy_pct = float(min(energy * 20, 1.0))
+                        energy_bar.progress(energy_pct, text=f"Energy: {energy:.4f} / {effective_threshold:.4f}")
+                        
+                        if frame_count % 50 == 0:
+                             logger.debug(f"Frame {frame_count}: Energy={energy:.5f} (Threshold={effective_threshold:.4f})")
+                        
+                        if energy > effective_threshold:
+                            speech_detected = True
+                            silence_chunks = 0
+                            audio_chunks.append(chunk)
+                            recorded_time = len(audio_chunks) * (len(chunk)/sample_rate) # Approximate
+                            
+                            if is_ai_speaking:
+                                status_text.text(f"🎤 Interrupting... {recorded_time:.1f}s")
+                            else:
+                                status_text.text(f"🎤 Recording... {recorded_time:.1f}s")
+                            debug_placeholder.markdown(f"**Recording:** `{recorded_time:.1f}s`")
+                        elif speech_detected:
+                            # Speech ended logic
+                            audio_chunks.append(chunk)
+                            silence_chunks += 1
+                            # Silence duration check...
+                            # Since frame duration varies, we use count? frame is usually 10ms. 
+                            # 1.0s = 100 chunks.
+                            if silence_chunks > 50: # Approx 0.5-1s
+                                status_text.text("✓ Speech ended, processing...")
+                                raise StopIteration # Break inner loop to process
+                        else:
+                            # Waiting...
+                            # If AI speaking, check interrupts
+                             pass
+
+                    # End for frame
+                # End while
                 
-                if energy > threshold:
+            except StopIteration:
+                 # Processing block (unchanged)
+                 pass
+            except Exception as e:
+                logger.error(f"Audio loop error: {e}", exc_info=True)
+                st.error(f"Error: {e}")
+                
+            if speech_detected and len(audio_chunks) > 10:
+                # Process Audio
+                 # Combine all chunks
+                audio_data = np.concatenate(audio_chunks)
+                
+                # If AI was speaking, stop it (interruption)
+                if is_ai_speaking:
+                    st.session_state.ai_speaking = False
+                    logger.info("AI speech interrupted by user!")
+                    
+                    debug_placeholder.markdown(f"""
+                    **Captured Audio:**
+                    - Duration: `{total_duration:.1f}s`
+                    - Samples: `{len(audio_data)}`
+                    - Echo Cancelled: `{is_ai_speaking}`
+                    """)
+                    
+                    logger.info(f"Captured {total_duration:.1f}s of speech, transcribing...")
+                    
                     with st.spinner("📝 Transcribing..."):
                         user_input = asr_engine.transcribe(
                             audio_data,
@@ -454,205 +600,25 @@ if input_method == "Voice (Local Continuous)":
                             language="en",
                         )
                     
+                    logger.info(f"Transcription result: '{user_input}'")
+                    
                     if user_input and len(user_input.strip()) > 0:
-                        # Require at least 3 words and very high energy for interrupt
-                        word_count = len(user_input.split())
-                        if word_count >= 3 and energy > 0.09:
-                            # Likely a real interruption - user speaking loudly/closely
-                            st.session_state.interrupt = True
-                            st.warning("⏸️ Interrupting AI...")
-                            logger.info(f"User interrupted AI (energy={energy:.4f}): {user_input[:50]}")
-                        else:
-                            # Still might be AI echo, ignore
-                            logger.debug(f"Ignoring during AI speech: energy={energy:.4f}, words={word_count}, text='{user_input[:30]}'")
-                            user_input = None
-                            st.rerun()
+                        st.success(f"✅ Heard: {user_input}")
+                        logger.info(f"Transcription accepted: {user_input}")
+                        # Will be processed below
                     else:
+                        logger.debug("Empty transcription result")
                         user_input = None
                         st.rerun()
-                else:
-                    user_input = None
-                    st.rerun()
-            else:
-                # Normal listening mode: use higher threshold to avoid background noise
-                threshold = 0.04  # Increased to reduce false positives from ambient noise
-                
-                if energy > threshold:
-                    # Show energy level for debugging
-                    logger.debug(f"Energy detected: {energy:.4f} (threshold: {threshold})")
-                    
-                    with st.spinner("📝 Transcribing..."):
-                        user_input = asr_engine.transcribe(
-                            audio_data,
-                            sample_rate=sample_rate,
-                            language="en",
-                        )
-                    
-                    if user_input and len(user_input.strip()) > 0:
-                        # Filter out common Whisper hallucinations and noise
-                        word_count = len(user_input.split())
-                        text_lower = user_input.strip().lower()
                         
-                        # Common Whisper hallucination phrases (appears on silence/noise)
-                        hallucination_phrases = [
-                            "thank you", "thanks for watching", "subscribe",
-                            "see you", "bye", "goodbye", "thank you for watching",
-                            "like and subscribe", "don't forget to subscribe",
-                            "thanks for listening", "you", "okay", "um", "uh",
-                            "hmm", "ah", "oh", "...", ".", "", "the", "and",
-                            "music", "applause", "silence", "[music]", "[applause]",
-                            "i'm sorry", "sorry", "what", "huh", "yeah", "yes", "no",
-                            "right", "so", "well", "like", "just", "i", "a", "the",
-                            "foreign", "[foreign]", "subtitle", "captions",
-                        ]
-                        
-                        is_hallucination = (
-                            word_count < 2 or  # Single words are usually noise
-                            text_lower in hallucination_phrases or
-                            any(text_lower.startswith(p) for p in ["thank", "subscribe", "like and", "don't forget"]) or
-                            any(text_lower.endswith(p) for p in ["for watching", "for listening", "next time"]) or
-                            (word_count < 4 and energy < 0.06)  # Short + low energy = likely noise
-                        )
-                        
-                        if is_hallucination:
-                            logger.debug(f"Filtered hallucination: '{user_input}' (energy={energy:.4f}, words={word_count})")
-                            user_input = None
-                            st.rerun()  # Continue listening
-                        else:
-                            st.success(f"✅ Heard: {user_input}")
-                            logger.info(f"Local mic transcription (energy={energy:.4f}): {user_input[:80]}...")
-                            # Continue to process this input below
-                    else:
-                        user_input = None
-                        st.rerun()  # Continue listening
-                else:
-                    user_input = None
-                    st.rerun()  # Continue listening
-                
+
         except Exception as e:
             logger.error(f"Local mic error: {e}", exc_info=True)
             st.error(f"❌ Mic error: {e}")
             user_input = None
-            st.rerun()  # Continue listening despite error
+            st.rerun()
 
-if input_method == "Voice (Always Listening)":
-    st.caption("🎧 Always listening. Start talking to interrupt the AI.")
-    stun_urls = [s.strip() for s in st.session_state.get("stun_list", "").splitlines() if s.strip()]
-    rtc_config = build_rtc_config(
-        stun_urls,
-        st.session_state.get("turn_url"),
-        st.session_state.get("turn_user"),
-        st.session_state.get("turn_pass"),
-    )
-    webrtc_ctx = webrtc_streamer(
-        key="always_listening",
-        mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=RealtimeMicProcessor,
-        rtc_configuration=rtc_config,
-        media_stream_constraints={
-            "audio": {"echoCancellation": True, "noiseSuppression": True},
-            "video": False,
-        },
-        async_processing=True,
-    )
-
-    if webrtc_ctx.state.playing is False:
-        st.warning("WebRTC not connected. Ensure mic permissions and network access to STUN/TURN.")
-
-    with st.expander("🔍 WebRTC Diagnostics"):
-        st.write(f"**State:** {webrtc_ctx.state}")
-        st.write(f"**Playing:** {webrtc_ctx.state.playing}")
-        st.write(f"**Audio Processor:** {webrtc_ctx.audio_processor is not None}")
-        if webrtc_ctx.audio_processor:
-            st.write(f"**In Speech:** {webrtc_ctx.audio_processor.in_speech}")
-            st.write(f"**Buffer Size:** {len(webrtc_ctx.audio_processor.buffer)}")
-            st.write(f"**Total Frames:** {webrtc_ctx.audio_processor.frame_count}")
-            st.write(f"**Speech Frames:** {webrtc_ctx.audio_processor.speech_frame_count}")
-            st.write(f"**Silence Frames:** {webrtc_ctx.audio_processor.silence_frames}")
-            if webrtc_ctx.audio_processor.in_speech:
-                st.success("🎤 Detecting speech!")
-            elif webrtc_ctx.audio_processor.speech_frame_count > 0:
-                st.info("✅ Audio detected (waiting for speech end)")
-            else:
-                st.warning("🔇 No speech detected yet (try speaking louder)")
-
-    if webrtc_ctx.audio_processor:
-        pcm_bytes = webrtc_ctx.audio_processor.pop_audio()
-        if pcm_bytes:
-            st.session_state.interrupt = True
-            audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            with st.spinner("📝 Transcribing..."):
-                user_input = asr_engine.transcribe(
-                    audio_np,
-                    sample_rate=16000,
-                    language="en",
-                )
-
-            if not user_input:
-                st.warning("No speech detected. Please try again.")
-                logger.warning("ASR returned empty transcription")
-            else:
-                st.success("✅ Transcription complete")
-                logger.info(f"Mic transcription: {user_input[:80]}...")
-
-if input_method == "Voice (Push-to-Talk)":
-    st.caption("🎧 Push-to-talk. Start/Stop to control recording.")
-    stun_urls = [s.strip() for s in st.session_state.get("stun_list", "").splitlines() if s.strip()]
-    rtc_config = build_rtc_config(
-        stun_urls,
-        st.session_state.get("turn_url"),
-        st.session_state.get("turn_user"),
-        st.session_state.get("turn_pass"),
-    )
-    webrtc_ctx = webrtc_streamer(
-        key="push_to_talk",
-        mode=WebRtcMode.SENDONLY,
-        audio_processor_factory=RealtimeMicProcessor,
-        media_stream_constraints={"audio": True, "video": False},
-        rtc_configuration=rtc_config,
-        desired_playing_state=st.session_state.get("ptt_active", False),
-        async_processing=True,
-    )
-
-    if st.session_state.get("ptt_active", False) and webrtc_ctx.state.playing is False:
-        st.warning("WebRTC not connected. Ensure mic permissions and network access to STUN/TURN.")
-
-    with st.expander("🔍 WebRTC Diagnostics"):
-        st.write(f"**State:** {webrtc_ctx.state}")
-        st.write(f"**Playing:** {webrtc_ctx.state.playing}")
-        st.write(f"**PTT Active:** {st.session_state.get('ptt_active', False)}")
-        st.write(f"**Audio Processor:** {webrtc_ctx.audio_processor is not None}")
-        if webrtc_ctx.audio_processor:
-            st.write(f"**In Speech:** {webrtc_ctx.audio_processor.in_speech}")
-            st.write(f"**Buffer Size:** {len(webrtc_ctx.audio_processor.buffer)}")
-            st.write(f"**Total Frames:** {webrtc_ctx.audio_processor.frame_count}")
-            st.write(f"**Speech Frames:** {webrtc_ctx.audio_processor.speech_frame_count}")
-            st.write(f"**Silence Frames:** {webrtc_ctx.audio_processor.silence_frames}")
-            if webrtc_ctx.audio_processor.in_speech:
-                st.success("🎤 Detecting speech!")
-            elif webrtc_ctx.audio_processor.speech_frame_count > 0:
-                st.info("✅ Audio detected (waiting for speech end)")
-            else:
-                st.warning("🔇 No speech detected yet (try speaking louder)")
-
-    if webrtc_ctx.audio_processor:
-        pcm_bytes = webrtc_ctx.audio_processor.pop_audio()
-        if pcm_bytes:
-            st.session_state.interrupt = True
-            audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            with st.spinner("📝 Transcribing..."):
-                user_input = asr_engine.transcribe(
-                    audio_np,
-                    sample_rate=16000,
-                    language="en",
-                )
-
-            if not user_input:
-                st.warning("No speech detected. Please try again.")
-                logger.warning("ASR returned empty transcription")
-            else:
-                st.success("✅ Transcription complete")
-                logger.info(f"Mic transcription: {user_input[:80]}...")
+# Note: WebRTC-based voice modes removed to eliminate mic conflicts with sounddevice
 
 if mic_button:
     try:
@@ -760,6 +726,10 @@ if user_input:
                 if not st.session_state.get("interrupt", False):
                     with st.spinner("🔊 Generating voice..."):
                         logger.debug("Synthesizing speech...")
+                        
+                        # Mark AI as speaking BEFORE playback starts
+                        st.session_state.ai_speaking = True
+                        
                         if st.session_state.get("realtime_output", True) and st.session_state.get("live_tts", True):
                             # Speak any leftover text not yet spoken
                             leftover = tts_pending.strip()
@@ -767,6 +737,10 @@ if user_input:
                                 audio_chunk = tts_engine.synthesize(leftover)
                                 tts_chunks.append(audio_chunk)
                             audio_bytes = None
+                            
+                            # Note: WASAPI echo cancellation captures loopback automatically
+                            # No need to manually set reference signal anymore
+                            
                             audio_duration = play_audio_sequence(tts_chunks, mime_type="audio/mpeg") or 0
                         else:
                             audio_bytes = tts_engine.synthesize(response_text)

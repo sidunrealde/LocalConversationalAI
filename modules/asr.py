@@ -27,8 +27,8 @@ class ASREngine:
     def __init__(
         self,
         model_size: str = "medium",
-        device: str = "cuda",
-        compute_type: str = "float16",
+        device: str = "cuda",  # GPU acceleration with CUDA 12
+        compute_type: str = "float16",  # FP16 for speed on RTX 4090
         model_dir: str = ".cache/whisper"
     ):
         """
@@ -107,26 +107,31 @@ class ASREngine:
             if audio_float.max() > 1.0 or audio_float.min() < -1.0:
                 audio_float = audio_float / 32768.0
             
-            # Transcribe with VAD filter to prevent hallucinations on silent audio
+            # Transcribe with VAD filter to prevent hallucinations
             segments, info = self.model.transcribe(
                 audio_float,
                 language=language,
                 beam_size=5,
                 best_of=5,
-                vad_filter=True,  # Use Silero VAD to filter out silence
-                vad_parameters={"min_silence_duration_ms": 500},
-                no_speech_threshold=0.6,  # Higher threshold = stricter no-speech detection
+                vad_filter=True,  # Re-enabled to filter silence/noise
+                vad_parameters={
+                    "min_silence_duration_ms": 300,  # Shorter silence detection
+                    "speech_pad_ms": 200,  # Padding around speech
+                    "min_speech_duration_ms": 100,  # Minimum speech to detect
+                },
+                no_speech_threshold=0.6,  # Filter segments with high no-speech probability
                 log_prob_threshold=-1.0,  # Filter low confidence
                 condition_on_previous_text=False,  # Prevent hallucination continuation
             )
             
-            # Collect all text, filtering out likely hallucinations
+            # Collect all text
             text_parts = []
             for segment in segments:
                 # Skip segments with high no_speech probability
-                if hasattr(segment, 'no_speech_prob') and segment.no_speech_prob > 0.5:
+                if hasattr(segment, 'no_speech_prob') and segment.no_speech_prob > 0.6:
                     logger.debug(f"Skipping segment with high no_speech_prob: {segment.no_speech_prob:.2f}")
                     continue
+                logger.debug(f"Segment: '{segment.text}' (no_speech: {getattr(segment, 'no_speech_prob', 0):.2f})")
                 text_parts.append(segment.text)
             text = "".join(text_parts).strip()
             

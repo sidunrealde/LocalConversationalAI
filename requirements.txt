@@ -1,0 +1,28 @@
+# Local Conversational AI Agent - Dependencies
+# Python 3.10+ required
+
+# Web UI
+streamlit>=1.28.0
+streamlit-webrtc>=0.47.0
+
+# Audio Processing
+sounddevice>=0.4.6
+soundfile>=0.12.1
+scipy>=1.11.0
+webrtcvad>=2.0.10
+soundcard>=0.4.2
+pywin32>=306
+librosa>=0.10.1  # Optional: for audio file transcription
+
+# Speech Recognition (ASR)
+faster-whisper>=0.10.0
+
+# Text-to-Speech (TTS)
+gTTS>=2.4.0
+
+# LLM Integration
+ollama>=0.1.0
+
+# Core Dependencies
+numpy>=1.24.0
+Pillow>=10.0.0
